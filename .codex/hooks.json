@@ -1,0 +1,15 @@
+{
+  "hooks": {
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "powershell.exe -NoProfile -ExecutionPolicy Bypass -Command \"[Console]::Beep(880, 1000)\"",
+            "timeout": 5
+          }
+        ]
+      }
+    ]
+  }
+}
