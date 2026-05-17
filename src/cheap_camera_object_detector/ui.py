@@ -70,7 +70,12 @@ class UiFrameEvent:
     frame: VideoFrame
 
 
-UiEvent: TypeAlias = UiLogEvent | UiFrameEvent
+@dataclass(frozen=True)
+class UiPreviewPlaceholderEvent:
+    message: str
+
+
+UiEvent: TypeAlias = UiLogEvent | UiFrameEvent | UiPreviewPlaceholderEvent
 
 
 class ImageEncoderProtocol(Protocol):
@@ -296,6 +301,7 @@ class DesktopUi:
             )
         except (MonitorError, ValueError) as exc:
             logger.exception("ui_monitor_failed error=%s", exc)
+            self._events.put(UiPreviewPlaceholderEvent("Unable to read camera frame."))
             self._events.put(UiLogEvent(f"Monitor error: {exc}"))
         finally:
             self._events.put(UiLogEvent("Monitor stopped."))
@@ -333,6 +339,7 @@ class DesktopUi:
             )
         except (CaptureError, ValueError) as exc:
             logger.exception("ui_capture_failed error=%s", exc)
+            self._events.put(UiPreviewPlaceholderEvent("Unable to read camera frame."))
             self._events.put(UiLogEvent(f"Capture error: {exc}"))
         else:
             self._events.put(UiFrameEvent(_copy_frame(result.frame)))
@@ -368,6 +375,8 @@ class DesktopUi:
                 break
             if isinstance(event, UiFrameEvent):
                 self._latest_frame.set(event.frame)
+            elif isinstance(event, UiPreviewPlaceholderEvent):
+                self._show_placeholder(event.message)
             else:
                 message = event.message
                 self._append_log(message)
@@ -388,7 +397,8 @@ class DesktopUi:
         self._latest_frame.set(_copy_frame(frame))
 
     def _queue_monitor_error(self, exc: Exception) -> None:
-        self._events.put(UiLogEvent(f"Monitor error: {exc}. Retrying."))
+        self._events.put(UiPreviewPlaceholderEvent("Unable to read camera frame."))
+        self._events.put(UiLogEvent(f"Monitor error: {exc}"))
 
     def _publish_latest_available_labels(self, labels: tuple[str, ...]) -> None:
         self._latest_labels.set(labels)
@@ -397,6 +407,10 @@ class DesktopUi:
         image = _frame_to_photo_image(frame)
         self._preview_image = image
         self._preview.configure(image=image, text="")
+
+    def _show_placeholder(self, message: str) -> None:
+        self._preview_image = None
+        self._preview.configure(image="", text=message)
 
     def _set_monitor_running(self, running: bool) -> None:
         self._start_button.configure(state=DISABLED if running else NORMAL)

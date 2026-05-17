@@ -168,12 +168,12 @@ class MonitoringObservabilityTests(unittest.TestCase):
         self.assertIs(sampled_frame, observed_frames[0])
         self.assertEqual([], fake_cv2.saved_frames)
 
-    def test_monitor_observes_newest_drained_frame(self) -> None:
-        old_frame = high_contrast_frame(fill=30)
+    def test_monitor_observes_first_frame_without_buffer_drain(self) -> None:
+        first_frame = high_contrast_frame(fill=30)
         middle_frame = high_contrast_frame(fill=90)
         newest_frame = high_contrast_frame(fill=150)
         observed_frames: list[VideoFrame] = []
-        fake_cv2 = FakeCv2(read_frames=[old_frame, middle_frame, newest_frame])
+        fake_cv2 = FakeCv2(read_frames=[first_frame, middle_frame, newest_frame])
         notifier = RecordingNotifier()
 
         with patch("cheap_camera_object_detector.rtsp_capture._cv2", return_value=fake_cv2):
@@ -192,7 +192,7 @@ class MonitoringObservabilityTests(unittest.TestCase):
             )
 
         self.assertEqual(1, len(observed_frames))
-        self.assertIs(newest_frame, observed_frames[0])
+        self.assertIs(first_frame, observed_frames[0])
 
     def test_monitor_can_display_frames_without_detection(self) -> None:
         sampled_frame = fake_frame()
@@ -246,7 +246,7 @@ class MonitoringObservabilityTests(unittest.TestCase):
                 ],
             ),
             patch(
-                "cheap_camera_object_detector.monitoring.read_latest_valid_frame",
+                "cheap_camera_object_detector.monitoring.read_first_frame",
                 side_effect=[
                     CaptureError("camera offline"),
                     FrameReadResult(sampled_frame, reads_used=1, attempts_used=1),
@@ -274,11 +274,12 @@ class MonitoringObservabilityTests(unittest.TestCase):
         self.assertTrue(open_capture_results[0][0].released)
         self.assertTrue(open_capture_results[1][0].released)
 
-    def test_monitor_rejects_gray_frames_before_observing_or_detecting(self) -> None:
-        sampled_frame = fake_frame()
+    def test_monitor_observes_first_frame_without_gray_frame_retry(self) -> None:
+        first_frame = fake_frame(fill=120)
+        second_frame = fake_frame()
         observed_frames: list[VideoFrame] = []
         FakeDetector.results = [[]]
-        fake_cv2 = FakeCv2(read_frames=[fake_frame(fill=120), sampled_frame])
+        fake_cv2 = FakeCv2(read_frames=[first_frame, second_frame])
 
         with (
             patch("cheap_camera_object_detector.rtsp_capture._cv2", return_value=fake_cv2),
@@ -295,10 +296,10 @@ class MonitoringObservabilityTests(unittest.TestCase):
                 NoopNotifier(),
                 max_frames=1,
                 frame_observer=observed_frames.append,
-            )
+        )
 
         self.assertEqual(1, len(observed_frames))
-        self.assertIs(sampled_frame, observed_frames[0])
+        self.assertIs(first_frame, observed_frames[0])
 
     def test_monitor_stops_when_stop_callback_requests_it(self) -> None:
         FakeDetector.results = [[], []]

@@ -18,17 +18,12 @@ from cheap_camera_object_detector.rtsp_capture import (
     CaptureError,
     FrameReadResult,
     open_rtsp_capture,
-    read_latest_valid_frame,
+    read_first_frame,
 )
 from cheap_camera_object_detector.protocols import VideoCaptureProtocol, VideoFrame
 
 
 logger = logging.getLogger(__name__)
-MONITOR_MINIMUM_FRAME_STDDEV = 10.0
-MONITOR_MINIMUM_FRAME_READ_ATTEMPTS = 30
-MONITOR_LATEST_FRAME_DRAIN_READS = 4
-
-
 class MonitorError(RuntimeError):
     """Raised when the camera monitor cannot continue."""
 
@@ -165,7 +160,6 @@ class _MonitorCaptureSession:
         self._config = config
         self._capture: VideoCaptureProtocol | None = None
         self._transport = ""
-        self._needs_warmup = True
 
     def read_frame(self, frame_count: int) -> VideoFrame:
         try:
@@ -200,7 +194,6 @@ class _MonitorCaptureSession:
         self._capture.release()
         self._capture = None
         self._transport = ""
-        self._needs_warmup = True
 
     def _read_frame_result(self, frame_count: int) -> FrameReadResult:
         if self._capture is None:
@@ -210,20 +203,11 @@ class _MonitorCaptureSession:
                 self._config.read_timeout_ms,
                 prefer_tcp=self._config.prefer_tcp,
             )
-            self._needs_warmup = True
 
-        result = read_latest_valid_frame(
+        result = read_first_frame(
             self._capture,
-            attempts=max(
-                self._config.frame_read_attempts,
-                MONITOR_MINIMUM_FRAME_READ_ATTEMPTS,
-            ),
-            warmup_frames=self._config.warmup_frames if self._needs_warmup else 0,
             log_context="monitor_capture",
-            minimum_frame_stddev=MONITOR_MINIMUM_FRAME_STDDEV,
-            drain_reads=MONITOR_LATEST_FRAME_DRAIN_READS,
         )
-        self._needs_warmup = False
         return result
 
 

@@ -15,7 +15,7 @@ from cheap_camera_object_detector.rtsp_capture import (
     capture_rtsp_frame,
     capture_rtsp_image,
     open_rtsp_capture,
-    read_latest_valid_frame,
+    read_first_frame,
 )
 
 
@@ -143,23 +143,37 @@ class RtspCaptureTests(unittest.TestCase):
         self.assertIn("flags;low_delay", options)
         self.assertIn("max_delay;0", options)
 
-    def test_read_latest_valid_frame_returns_newest_drained_frame(self) -> None:
-        old_frame = fake_frame(fill=10)
-        middle_frame = fake_frame(fill=80)
-        newest_frame = fake_frame(fill=140)
-        capture = FakeCapture([old_frame, middle_frame, newest_frame])
+    def test_read_first_frame_returns_first_frame_without_retry_or_drain(self) -> None:
+        first_frame = fake_frame(fill=10)
+        second_frame = fake_frame(fill=80)
+        capture = FakeCapture([first_frame, second_frame])
 
-        result = read_latest_valid_frame(
+        result = read_first_frame(
             capture,
-            attempts=1,
-            warmup_frames=0,
             log_context="test_capture",
-            drain_reads=2,
         )
 
-        self.assertIs(newest_frame, result.frame)
-        self.assertEqual(3, result.reads_used)
-        self.assertEqual(3, result.attempts_used)
+        self.assertIs(first_frame, result.frame)
+        self.assertEqual(1, result.reads_used)
+        self.assertEqual(1, result.attempts_used)
+
+    def test_read_first_frame_rejects_failed_read(self) -> None:
+        capture = FakeCapture([], failed_reads=1)
+
+        with self.assertRaisesRegex(CaptureError, "primeiro frame"):
+            read_first_frame(capture, log_context="test_capture")
+
+    def test_read_first_frame_rejects_none_frame(self) -> None:
+        capture = FakeCapture([None])
+
+        with self.assertRaisesRegex(CaptureError, "primeiro frame"):
+            read_first_frame(capture, log_context="test_capture")
+
+    def test_read_first_frame_rejects_empty_frame(self) -> None:
+        capture = FakeCapture([np.array([], dtype=np.uint8)])
+
+        with self.assertRaisesRegex(CaptureError, "primeiro frame"):
+            read_first_frame(capture, log_context="test_capture")
 
 
 def fake_frame(*, fill: int | None = None) -> VideoFrame:
@@ -169,12 +183,22 @@ def fake_frame(*, fill: int | None = None) -> VideoFrame:
 
 
 class FakeCapture:
-    def __init__(self, frames: list[VideoFrame], *, opened: bool = True) -> None:
+    def __init__(
+        self,
+        frames: list[VideoFrame | None],
+        *,
+        opened: bool = True,
+        failed_reads: int = 0,
+    ) -> None:
         self._frames = frames
         self._opened = opened
+        self._failed_reads = failed_reads
         self.released = False
 
     def read(self) -> tuple[bool, VideoFrame | None]:
+        if self._failed_reads:
+            self._failed_reads -= 1
+            return False, None
         if not self._frames:
             return False, None
         return True, self._frames.pop(0)
@@ -193,7 +217,7 @@ class FakeCv2:
 
     def __init__(
         self,
-        read_frames: list[VideoFrame],
+        read_frames: list[VideoFrame | None],
         open_results: list[bool] | None = None,
     ) -> None:
         self.saved_paths: list[str] = []

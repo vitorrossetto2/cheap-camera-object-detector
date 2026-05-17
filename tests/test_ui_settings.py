@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import queue
 import unittest
+from typing import cast
 from unittest.mock import patch
 
 import numpy as np
@@ -13,6 +14,8 @@ from cheap_camera_object_detector.ui import (
     LatestLabelsSlot,
     UiFrameEvent,
     UiEvent,
+    UiLogEvent,
+    UiPreviewPlaceholderEvent,
     UiSettings,
     build_capture_settings,
     build_monitor_config,
@@ -114,6 +117,22 @@ class UiSettingsTests(unittest.TestCase):
         self.assertTrue(events.empty())
         latest_labels = ui._latest_labels.pop()  # pyright: ignore[reportPrivateUsage]
         self.assertEqual(("cell phone", "dog"), latest_labels)
+
+    def test_monitor_error_callback_queues_preview_placeholder(self) -> None:
+        events: queue.Queue[UiEvent] = queue.Queue()
+        ui = DesktopUi.__new__(DesktopUi)
+        ui._events = events  # pyright: ignore[reportPrivateUsage]
+
+        ui._queue_monitor_error(RuntimeError("camera offline"))  # pyright: ignore[reportPrivateUsage]
+
+        placeholder = events.get_nowait()
+        log_event = events.get_nowait()
+        self.assertIsInstance(placeholder, UiPreviewPlaceholderEvent)
+        placeholder = cast(UiPreviewPlaceholderEvent, placeholder)
+        self.assertEqual("Unable to read camera frame.", placeholder.message)
+        self.assertIsInstance(log_event, UiLogEvent)
+        log_event = cast(UiLogEvent, log_event)
+        self.assertEqual("Monitor error: camera offline", log_event.message)
 
 
 def ui_settings(*, transport: str) -> UiSettings:

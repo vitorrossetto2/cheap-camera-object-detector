@@ -19,9 +19,9 @@ continues to display camera frames without loading YOLO or sending alerts.
 The default model downloads on first use if it is not already cached. Standard
 COCO labels include `person`, `car`, `dog`, `cat`, `cell phone`, and `bottle`.
 
-The monitor favors preview freshness over showing every frame. It drains a small
-number of buffered RTSP frames before display and configures OpenCV/FFmpeg with
-low-latency capture options by default.
+The monitor reads one frame from the RTSP stream for each display cycle and sends
+that same frame to the detector when detection is enabled. OpenCV/FFmpeg is still
+configured with low-latency capture options by default.
 
 ## Type checking
 

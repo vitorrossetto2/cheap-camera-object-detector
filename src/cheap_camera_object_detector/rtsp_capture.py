@@ -19,7 +19,6 @@ LOW_LATENCY_FFMPEG_OPTIONS = {
     "flags": "low_delay",
     "max_delay": "0",
 }
-DEFAULT_LATEST_FRAME_DRAIN_READS = 4
 
 
 class CaptureError(RuntimeError):
@@ -82,10 +81,8 @@ def capture_rtsp_frame(
     )
 
     try:
-        frame_result = read_valid_frame(
+        frame_result = read_first_frame(
             capture,
-            attempts=attempts,
-            warmup_frames=warmup_frames,
             log_context="rtsp_capture",
         )
     finally:
@@ -196,53 +193,33 @@ def read_valid_frame(
     log_context: str,
     minimum_frame_stddev: float = 0.0,
 ) -> FrameReadResult:
-    _validate_positive("attempts", attempts)
-    _validate_non_negative("warmup_frames", warmup_frames)
-    _validate_non_negative_float("minimum_frame_stddev", minimum_frame_stddev)
+    return read_first_frame(capture, log_context=log_context)
 
-    max_reads = warmup_frames + attempts
-    for read_index in range(max_reads):
-        ok, candidate = capture.read()
-        reads_used = read_index + 1
-        is_warmup = read_index < warmup_frames
-        frame_stddev = _frame_stddev(candidate)
-        logger.info(
-            "%s_frame_read index=%s warmup=%s ok=%s frame_is_none=%s "
-            "frame_size=%s frame_stddev=%s",
-            log_context,
-            reads_used,
-            is_warmup,
-            ok,
-            candidate is None,
-            getattr(candidate, "size", None),
-            frame_stddev,
-        )
-        if not ok or candidate is None or candidate.size == 0:
-            continue
-        if is_warmup:
-            continue
-        if frame_stddev is not None and frame_stddev < minimum_frame_stddev:
-            logger.info(
-                "%s_frame_rejected index=%s reason=low_stddev frame_stddev=%s "
-                "minimum_frame_stddev=%s",
-                log_context,
-                reads_used,
-                frame_stddev,
-                minimum_frame_stddev,
-            )
-            continue
-        return FrameReadResult(
-            frame=candidate,
-            reads_used=reads_used,
-            attempts_used=max(1, reads_used - warmup_frames),
-        )
 
-    logger.error(
-        "%s_frame_read_failed reason=no_valid_frame max_reads=%s",
+def read_first_frame(
+    capture: VideoCaptureProtocol,
+    *,
+    log_context: str,
+) -> FrameReadResult:
+    ok, candidate = capture.read()
+    _log_frame_read(
         log_context,
-        max_reads,
+        1,
+        ok=ok,
+        candidate=candidate,
     )
-    raise CaptureError(f"nenhum frame valido recebido apos {max_reads} leituras")
+    if not ok or candidate is None or candidate.size == 0:
+        logger.error(
+            "%s_frame_read_failed reason=invalid_first_frame reads_used=1",
+            log_context,
+        )
+        raise CaptureError("primeiro frame RTSP nao foi recebido ou esta vazio")
+
+    return FrameReadResult(
+        frame=candidate,
+        reads_used=1,
+        attempts_used=1,
+    )
 
 
 def read_latest_valid_frame(
@@ -252,85 +229,9 @@ def read_latest_valid_frame(
     warmup_frames: int,
     log_context: str,
     minimum_frame_stddev: float = 0.0,
-    drain_reads: int = DEFAULT_LATEST_FRAME_DRAIN_READS,
+    drain_reads: int = 0,
 ) -> FrameReadResult:
-    _validate_positive("attempts", attempts)
-    _validate_non_negative("warmup_frames", warmup_frames)
-    _validate_non_negative_float("minimum_frame_stddev", minimum_frame_stddev)
-    _validate_non_negative("drain_reads", drain_reads)
-
-    latest_frame: VideoFrame | None = None
-    reads_used = 0
-
-    for _ in range(warmup_frames):
-        ok, candidate = capture.read()
-        reads_used += 1
-        _log_frame_read(
-            log_context,
-            reads_used,
-            warmup=True,
-            drain=False,
-            ok=ok,
-            candidate=candidate,
-        )
-
-    for _ in range(attempts):
-        ok, candidate = capture.read()
-        reads_used += 1
-        _log_frame_read(
-            log_context,
-            reads_used,
-            warmup=False,
-            drain=False,
-            ok=ok,
-            candidate=candidate,
-        )
-        if _is_valid_frame(
-            candidate,
-            ok=ok,
-            minimum_frame_stddev=minimum_frame_stddev,
-            log_context=log_context,
-            reads_used=reads_used,
-        ):
-            assert candidate is not None
-            latest_frame = candidate
-            break
-
-    if latest_frame is None:
-        max_reads = warmup_frames + attempts
-        logger.error(
-            "%s_frame_read_failed reason=no_valid_frame max_reads=%s",
-            log_context,
-            max_reads,
-        )
-        raise CaptureError(f"nenhum frame valido recebido apos {max_reads} leituras")
-
-    for _drain_index in range(drain_reads):
-        ok, candidate = capture.read()
-        reads_used += 1
-        _log_frame_read(
-            log_context,
-            reads_used,
-            warmup=False,
-            drain=True,
-            ok=ok,
-            candidate=candidate,
-        )
-        if _is_valid_frame(
-            candidate,
-            ok=ok,
-            minimum_frame_stddev=minimum_frame_stddev,
-            log_context=log_context,
-            reads_used=reads_used,
-        ):
-            assert candidate is not None
-            latest_frame = candidate
-
-    return FrameReadResult(
-        frame=latest_frame,
-        reads_used=reads_used,
-        attempts_used=max(1, reads_used - warmup_frames),
-    )
+    return read_first_frame(capture, log_context=log_context)
 
 
 def write_frame(frame: VideoFrame, output_path: str | Path) -> Path:
@@ -419,32 +320,18 @@ def _validate_non_negative(name: str, value: int) -> None:
         raise ValueError(f"{name} nao pode ser negativo")
 
 
-def _validate_non_negative_float(name: str, value: float) -> None:
-    if value < 0:
-        logger.error(
-            "rtsp_capture_validation_failed parameter=%s value=%s reason=negative",
-            name,
-            value,
-        )
-        raise ValueError(f"{name} nao pode ser negativo")
-
-
 def _log_frame_read(
     log_context: str,
     reads_used: int,
     *,
-    warmup: bool,
-    drain: bool,
     ok: bool,
     candidate: VideoFrame | None,
 ) -> None:
     logger.info(
-        "%s_frame_read index=%s warmup=%s drain=%s ok=%s frame_is_none=%s "
+        "%s_frame_read index=%s ok=%s frame_is_none=%s "
         "frame_size=%s frame_stddev=%s",
         log_context,
         reads_used,
-        warmup,
-        drain,
         ok,
         candidate is None,
         getattr(candidate, "size", None),
@@ -452,34 +339,11 @@ def _log_frame_read(
     )
 
 
-def _is_valid_frame(
-    frame: VideoFrame | None,
-    *,
-    ok: bool,
-    minimum_frame_stddev: float,
-    log_context: str,
-    reads_used: int,
-) -> bool:
-    if not ok or frame is None or frame.size == 0:
-        return False
-
-    frame_stddev = _frame_stddev(frame)
-    if frame_stddev is not None and frame_stddev < minimum_frame_stddev:
-        logger.info(
-            "%s_frame_rejected index=%s reason=low_stddev frame_stddev=%s "
-            "minimum_frame_stddev=%s",
-            log_context,
-            reads_used,
-            frame_stddev,
-            minimum_frame_stddev,
-        )
-        return False
-    return True
-
-
 def _frame_stddev(frame: VideoFrame | None) -> float | None:
     if frame is None:
         return None
+    if frame.size == 0:
+        return 0.0
 
     try:
         return float(frame.std())
