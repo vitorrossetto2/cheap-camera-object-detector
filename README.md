@@ -12,11 +12,16 @@ uv run python main.py
 ```
 
 The window uses the `.env` defaults. It can start and stop object monitoring,
-capture one image, display the latest camera frame, and show status and alert
-messages.
+enable or disable object detection, capture one image, display the latest camera
+frame, and show status and alert messages. When detection is disabled, monitoring
+continues to display camera frames without loading YOLO or sending alerts.
 
 The default model downloads on first use if it is not already cached. Standard
 COCO labels include `person`, `car`, `dog`, `cat`, `cell phone`, and `bottle`.
+
+The monitor favors preview freshness over showing every frame. It drains a small
+number of buffered RTSP frames before display and configures OpenCV/FFmpeg with
+low-latency capture options by default.
 
 ## Type checking
 

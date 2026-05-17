@@ -1,0 +1,1 @@
+ - arrumar o motivo de estar lento a exibição e detecção

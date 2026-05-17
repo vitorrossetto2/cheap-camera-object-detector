@@ -1,13 +1,18 @@
 from __future__ import annotations
 
 import os
+import queue
 import unittest
 from unittest.mock import patch
 
 import numpy as np
 
 from cheap_camera_object_detector.ui import (
+    DesktopUi,
     LatestFrameSlot,
+    LatestLabelsSlot,
+    UiFrameEvent,
+    UiEvent,
     UiSettings,
     build_capture_settings,
     build_monitor_config,
@@ -21,6 +26,7 @@ class UiSettingsTests(unittest.TestCase):
             "RTSP_URL": "rtsp://user:secret@camera.local:554/stream1",
             "RTSP_TRANSPORT": "tcp",
             "DETECTION_TARGET": "person",
+            "DETECTION_ENABLED": "false",
             "DETECTION_MODEL": "yolo11n.pt",
             "DETECTION_CONFIDENCE": "0.45",
         }
@@ -31,6 +37,7 @@ class UiSettingsTests(unittest.TestCase):
         self.assertEqual("rtsp://user:secret@camera.local:554/stream1", settings.source)
         self.assertEqual("tcp", settings.transport)
         self.assertEqual("person", settings.target)
+        self.assertFalse(settings.detection_enabled)
         self.assertEqual("yolo11n.pt", settings.model_name)
         self.assertEqual(0.45, settings.confidence)
 
@@ -41,6 +48,7 @@ class UiSettingsTests(unittest.TestCase):
 
         self.assertEqual(settings.source, config.source)
         self.assertEqual(settings.target, config.target)
+        self.assertEqual(settings.detection_enabled, config.detection_enabled)
         self.assertEqual(settings.model_name, config.model_name)
         self.assertEqual(settings.confidence, config.confidence)
         self.assertTrue(config.prefer_tcp)
@@ -69,11 +77,50 @@ class UiSettingsTests(unittest.TestCase):
         self.assertIs(second_frame, slot.pop())
         self.assertIsNone(slot.pop())
 
+    def test_monitor_frame_callback_uses_latest_frame_slot_not_event_queue(self) -> None:
+        frame = np.array([[[255, 255, 255]]], dtype=np.uint8)
+        events: queue.Queue[UiEvent] = queue.Queue()
+        ui = DesktopUi.__new__(DesktopUi)
+        ui._events = events  # pyright: ignore[reportPrivateUsage]
+        ui._latest_frame = LatestFrameSlot()  # pyright: ignore[reportPrivateUsage]
+
+        ui._publish_latest_monitor_frame(frame)  # pyright: ignore[reportPrivateUsage]
+
+        self.assertTrue(events.empty())
+        self.assertIsNone(_pop_frame_event(events))
+        latest_frame = ui._latest_frame.pop()  # pyright: ignore[reportPrivateUsage]
+        self.assertIsNotNone(latest_frame)
+        self.assertIsNot(frame, latest_frame)
+        np.testing.assert_array_equal(frame, latest_frame)
+
+    def test_latest_labels_slot_keeps_only_newest_labels(self) -> None:
+        slot = LatestLabelsSlot()
+
+        slot.set(("person",))
+        slot.set(("cell phone", "dog"))
+
+        self.assertEqual(("cell phone", "dog"), slot.pop())
+        self.assertIsNone(slot.pop())
+
+    def test_available_labels_callback_uses_latest_labels_slot_not_event_queue(self) -> None:
+        events: queue.Queue[UiEvent] = queue.Queue()
+        ui = DesktopUi.__new__(DesktopUi)
+        ui._events = events  # pyright: ignore[reportPrivateUsage]
+        ui._latest_labels = LatestLabelsSlot()  # pyright: ignore[reportPrivateUsage]
+
+        ui._publish_latest_available_labels(("person",))  # pyright: ignore[reportPrivateUsage]
+        ui._publish_latest_available_labels(("cell phone", "dog"))  # pyright: ignore[reportPrivateUsage]
+
+        self.assertTrue(events.empty())
+        latest_labels = ui._latest_labels.pop()  # pyright: ignore[reportPrivateUsage]
+        self.assertEqual(("cell phone", "dog"), latest_labels)
+
 
 def ui_settings(*, transport: str) -> UiSettings:
     return UiSettings(
         source="rtsp://user:secret@camera.local:554/stream1",
         target="dog",
+        detection_enabled=True,
         model_name="yolo11n.pt",
         confidence=0.35,
         transport=transport,
@@ -87,6 +134,14 @@ def ui_settings(*, transport: str) -> UiSettings:
         warmup_frames=3,
         frame_read_attempts=8,
     )
+
+
+def _pop_frame_event(events: queue.Queue[UiEvent]) -> UiFrameEvent | None:
+    while not events.empty():
+        event = events.get_nowait()
+        if isinstance(event, UiFrameEvent):
+            return event
+    return None
 
 
 if __name__ == "__main__":

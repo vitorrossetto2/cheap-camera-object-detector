@@ -14,6 +14,12 @@ from cheap_camera_object_detector.protocols import (
 )
 
 logger = logging.getLogger(__name__)
+LOW_LATENCY_FFMPEG_OPTIONS = {
+    "fflags": "nobuffer",
+    "flags": "low_delay",
+    "max_delay": "0",
+}
+DEFAULT_LATEST_FRAME_DRAIN_READS = 4
 
 
 class CaptureError(RuntimeError):
@@ -151,31 +157,35 @@ def open_rtsp_capture(
     *,
     prefer_tcp: bool,
 ) -> tuple[VideoCaptureProtocol, str]:
-    transport = "tcp" if prefer_tcp else "udp"
-    logger.info(
-        "rtsp_capture_open_start source=%s transport=%s open_timeout_ms=%s "
-        "read_timeout_ms=%s",
-        _mask_rtsp_password(source_url),
-        transport,
-        open_timeout_ms,
-        read_timeout_ms,
-    )
-    _configure_ffmpeg_transport(transport)
-    capture = _open_capture(source_url, open_timeout_ms, read_timeout_ms)
-    if capture.isOpened():
+    attempted_transports: list[str] = []
+    for transport in _transport_attempt_order(prefer_tcp):
+        attempted_transports.append(transport)
         logger.info(
-            "rtsp_capture_open_succeeded source=%s transport=%s",
+            "rtsp_capture_open_start source=%s transport=%s open_timeout_ms=%s "
+            "read_timeout_ms=%s",
+            _mask_rtsp_password(source_url),
+            transport,
+            open_timeout_ms,
+            read_timeout_ms,
+        )
+        _configure_ffmpeg_transport(transport)
+        capture = _open_capture(source_url, open_timeout_ms, read_timeout_ms)
+        if capture.isOpened():
+            logger.info(
+                "rtsp_capture_open_succeeded source=%s transport=%s",
+                _mask_rtsp_password(source_url),
+                transport,
+            )
+            return capture, transport
+        capture.release()
+        logger.error(
+            "rtsp_capture_open_failed source=%s transport=%s",
             _mask_rtsp_password(source_url),
             transport,
         )
-        return capture, transport
-    capture.release()
-    logger.error(
-        "rtsp_capture_open_failed source=%s transport=%s",
-        _mask_rtsp_password(source_url),
-        transport,
-    )
-    raise CaptureError(f"nao foi possivel abrir o stream RTSP usando {transport.upper()}")
+
+    transports = ", ".join(transport.upper() for transport in attempted_transports)
+    raise CaptureError(f"nao foi possivel abrir o stream RTSP usando {transports}")
 
 
 def read_valid_frame(
@@ -235,6 +245,94 @@ def read_valid_frame(
     raise CaptureError(f"nenhum frame valido recebido apos {max_reads} leituras")
 
 
+def read_latest_valid_frame(
+    capture: VideoCaptureProtocol,
+    *,
+    attempts: int,
+    warmup_frames: int,
+    log_context: str,
+    minimum_frame_stddev: float = 0.0,
+    drain_reads: int = DEFAULT_LATEST_FRAME_DRAIN_READS,
+) -> FrameReadResult:
+    _validate_positive("attempts", attempts)
+    _validate_non_negative("warmup_frames", warmup_frames)
+    _validate_non_negative_float("minimum_frame_stddev", minimum_frame_stddev)
+    _validate_non_negative("drain_reads", drain_reads)
+
+    latest_frame: VideoFrame | None = None
+    reads_used = 0
+
+    for _ in range(warmup_frames):
+        ok, candidate = capture.read()
+        reads_used += 1
+        _log_frame_read(
+            log_context,
+            reads_used,
+            warmup=True,
+            drain=False,
+            ok=ok,
+            candidate=candidate,
+        )
+
+    for _ in range(attempts):
+        ok, candidate = capture.read()
+        reads_used += 1
+        _log_frame_read(
+            log_context,
+            reads_used,
+            warmup=False,
+            drain=False,
+            ok=ok,
+            candidate=candidate,
+        )
+        if _is_valid_frame(
+            candidate,
+            ok=ok,
+            minimum_frame_stddev=minimum_frame_stddev,
+            log_context=log_context,
+            reads_used=reads_used,
+        ):
+            assert candidate is not None
+            latest_frame = candidate
+            break
+
+    if latest_frame is None:
+        max_reads = warmup_frames + attempts
+        logger.error(
+            "%s_frame_read_failed reason=no_valid_frame max_reads=%s",
+            log_context,
+            max_reads,
+        )
+        raise CaptureError(f"nenhum frame valido recebido apos {max_reads} leituras")
+
+    for _drain_index in range(drain_reads):
+        ok, candidate = capture.read()
+        reads_used += 1
+        _log_frame_read(
+            log_context,
+            reads_used,
+            warmup=False,
+            drain=True,
+            ok=ok,
+            candidate=candidate,
+        )
+        if _is_valid_frame(
+            candidate,
+            ok=ok,
+            minimum_frame_stddev=minimum_frame_stddev,
+            log_context=log_context,
+            reads_used=reads_used,
+        ):
+            assert candidate is not None
+            latest_frame = candidate
+
+    return FrameReadResult(
+        frame=latest_frame,
+        reads_used=reads_used,
+        attempts_used=max(1, reads_used - warmup_frames),
+    )
+
+
 def write_frame(frame: VideoFrame, output_path: str | Path) -> Path:
     destination = Path(output_path)
     destination.parent.mkdir(parents=True, exist_ok=True)
@@ -245,8 +343,22 @@ def write_frame(frame: VideoFrame, output_path: str | Path) -> Path:
 
 
 def _configure_ffmpeg_transport(transport: str) -> None:
-    os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = f"rtsp_transport;{transport}"
-    logger.info("opencv_ffmpeg_capture_options_set transport=%s", transport)
+    options = _merge_ffmpeg_capture_options(
+        os.environ.get("OPENCV_FFMPEG_CAPTURE_OPTIONS", ""),
+        transport,
+    )
+    os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = options
+    logger.info(
+        "opencv_ffmpeg_capture_options_set transport=%s options=%s",
+        transport,
+        options,
+    )
+
+
+def _transport_attempt_order(prefer_tcp: bool) -> tuple[str, str]:
+    if prefer_tcp:
+        return ("tcp", "udp")
+    return ("udp", "tcp")
 
 
 def _open_capture(
@@ -260,12 +372,8 @@ def _open_capture(
         open_timeout_ms,
         cv2.CAP_PROP_READ_TIMEOUT_MSEC,
         read_timeout_ms,
-        cv2.CAP_PROP_BUFFERSIZE,
-        1,
     ]
-    capture = cv2.VideoCapture(source_url, cv2.CAP_FFMPEG, params)
-    capture.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-    return capture
+    return cv2.VideoCapture(source_url, cv2.CAP_FFMPEG, params)
 
 
 def _cv2() -> Cv2Protocol:
@@ -321,6 +429,54 @@ def _validate_non_negative_float(name: str, value: float) -> None:
         raise ValueError(f"{name} nao pode ser negativo")
 
 
+def _log_frame_read(
+    log_context: str,
+    reads_used: int,
+    *,
+    warmup: bool,
+    drain: bool,
+    ok: bool,
+    candidate: VideoFrame | None,
+) -> None:
+    logger.info(
+        "%s_frame_read index=%s warmup=%s drain=%s ok=%s frame_is_none=%s "
+        "frame_size=%s frame_stddev=%s",
+        log_context,
+        reads_used,
+        warmup,
+        drain,
+        ok,
+        candidate is None,
+        getattr(candidate, "size", None),
+        _frame_stddev(candidate),
+    )
+
+
+def _is_valid_frame(
+    frame: VideoFrame | None,
+    *,
+    ok: bool,
+    minimum_frame_stddev: float,
+    log_context: str,
+    reads_used: int,
+) -> bool:
+    if not ok or frame is None or frame.size == 0:
+        return False
+
+    frame_stddev = _frame_stddev(frame)
+    if frame_stddev is not None and frame_stddev < minimum_frame_stddev:
+        logger.info(
+            "%s_frame_rejected index=%s reason=low_stddev frame_stddev=%s "
+            "minimum_frame_stddev=%s",
+            log_context,
+            reads_used,
+            frame_stddev,
+            minimum_frame_stddev,
+        )
+        return False
+    return True
+
+
 def _frame_stddev(frame: VideoFrame | None) -> float | None:
     if frame is None:
         return None
@@ -329,6 +485,39 @@ def _frame_stddev(frame: VideoFrame | None) -> float | None:
         return float(frame.std())
     except (TypeError, ValueError):
         return None
+
+
+def _merge_ffmpeg_capture_options(existing: str, transport: str) -> str:
+    merged = _parse_ffmpeg_capture_options(existing)
+    merged["rtsp_transport"] = transport
+    for key, value in LOW_LATENCY_FFMPEG_OPTIONS.items():
+        if key in {"fflags", "flags"}:
+            merged[key] = _merge_ffmpeg_flag(merged.get(key, ""), value)
+        elif key not in merged:
+            merged[key] = value
+    return "|".join(f"{key};{value}" for key, value in merged.items())
+
+
+def _merge_ffmpeg_flag(existing: str, flag: str) -> str:
+    if not existing:
+        return flag
+    values = existing.split("+")
+    if flag in values:
+        return existing
+    return f"{existing}+{flag}"
+
+
+def _parse_ffmpeg_capture_options(value: str) -> dict[str, str]:
+    options: dict[str, str] = {}
+    for item in value.split("|"):
+        if ";" not in item:
+            continue
+        key, option_value = item.split(";", 1)
+        key = key.strip()
+        option_value = option_value.strip()
+        if key:
+            options[key] = option_value
+    return options
 
 
 def _mask_rtsp_password(source_url: str) -> str:

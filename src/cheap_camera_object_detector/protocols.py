@@ -54,9 +54,6 @@ class VideoCaptureProtocol(Protocol):
     def read(self) -> tuple[bool, VideoFrame | None]:
         ...
 
-    def set(self, propId: int, value: float) -> bool:
-        ...
-
     def isOpened(self) -> bool:
         ...
 
@@ -67,7 +64,6 @@ class VideoCaptureProtocol(Protocol):
 class Cv2Protocol(Protocol):
     CAP_PROP_OPEN_TIMEOUT_MSEC: int
     CAP_PROP_READ_TIMEOUT_MSEC: int
-    CAP_PROP_BUFFERSIZE: int
     CAP_FFMPEG: int
 
     def VideoCapture(

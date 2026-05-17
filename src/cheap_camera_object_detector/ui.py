@@ -6,7 +6,7 @@ import queue
 import threading
 from base64 import b64encode
 from dataclasses import dataclass
-from tkinter import END, DISABLED, NORMAL, PhotoImage, StringVar, Text, Tk
+from tkinter import BooleanVar, END, DISABLED, NORMAL, PhotoImage, StringVar, Text, Tk
 from tkinter import ttk
 from typing import Protocol, TypeAlias, cast
 
@@ -35,6 +35,7 @@ logger = logging.getLogger(__name__)
 class UiSettings:
     source: str
     target: str
+    detection_enabled: bool
     model_name: str
     confidence: float
     transport: str
@@ -81,11 +82,12 @@ def default_ui_settings() -> UiSettings:
     return UiSettings(
         source=os.getenv("RTSP_URL", "rtsp://user:password@camera.local:554/stream1"),
         target=os.getenv("DETECTION_TARGET", "dog"),
+        detection_enabled=_env_bool("DETECTION_ENABLED", True),
         model_name=os.getenv("DETECTION_MODEL", "yolo11n.pt"),
         confidence=_env_float("DETECTION_CONFIDENCE", 0.35),
         transport=os.getenv("RTSP_TRANSPORT", "udp").lower(),
         image_size=_env_int("DETECTION_IMAGE_SIZE", 640),
-        frame_interval_seconds=_env_float("DETECTION_FRAME_INTERVAL_SECONDS", 0.2),
+        frame_interval_seconds=_env_float("DETECTION_FRAME_INTERVAL_SECONDS", 0.5),
         alert_cooldown_seconds=_env_float("ALERT_COOLDOWN_SECONDS", 5.0),
         beep_frequency_hz=_env_int("BEEP_FREQUENCY_HZ", 1200),
         beep_duration_ms=_env_int("BEEP_DURATION_MS", 2000),
@@ -103,6 +105,7 @@ def build_monitor_config(settings: UiSettings) -> MonitorConfig:
     return MonitorConfig(
         source=settings.source,
         target=settings.target,
+        detection_enabled=settings.detection_enabled,
         model_name=settings.model_name,
         confidence=settings.confidence,
         image_size=settings.image_size,
@@ -139,6 +142,7 @@ class DesktopUi:
         self._root = root
         self._events: queue.Queue[UiEvent] = queue.Queue()
         self._latest_frame = LatestFrameSlot()
+        self._latest_labels = LatestLabelsSlot()
         self._stop_event = threading.Event()
         self._monitor_thread: threading.Thread | None = None
         self._capture_thread: threading.Thread | None = None
@@ -146,29 +150,35 @@ class DesktopUi:
 
         self._source = StringVar(value=defaults.source)
         self._target = StringVar(value=defaults.target)
+        self._detection_enabled = BooleanVar(value=defaults.detection_enabled)
         self._model_name = StringVar(value=defaults.model_name)
         self._confidence = StringVar(value=str(defaults.confidence))
         self._transport = StringVar(value=defaults.transport)
+        self._available_labels_text = StringVar(
+            value="Waiting for detector results."
+        )
 
         root.columnconfigure(0, weight=1)
         root.rowconfigure(0, weight=1)
         frame = ttk.Frame(root, padding=12)
         frame.grid(row=0, column=0, sticky="nsew")
         frame.columnconfigure(1, weight=1)
-        frame.rowconfigure(5, weight=1)
-        frame.rowconfigure(8, weight=1)
+        frame.rowconfigure(7, weight=1)
+        frame.rowconfigure(9, weight=1)
 
         self._add_field(frame, "Camera source", self._source, 0)
         self._add_field(frame, "Target object", self._target, 1)
         self._add_field(frame, "Model", self._model_name, 2)
         self._add_field(frame, "Confidence", self._confidence, 3)
         self._add_transport(frame, 4)
+        self._add_detection_toggle(frame, 5)
+        self._add_available_labels(frame, 6)
 
         self._preview = ttk.Label(frame, text="No image captured yet.", anchor="center")
-        self._preview.grid(row=5, column=0, columnspan=2, sticky="nsew", pady=(8, 0))
+        self._preview.grid(row=7, column=0, columnspan=2, sticky="nsew", pady=(8, 0))
 
         actions = ttk.Frame(frame)
-        actions.grid(row=7, column=0, columnspan=2, sticky="ew", pady=(8, 8))
+        actions.grid(row=8, column=0, columnspan=2, sticky="ew", pady=(8, 8))
         actions.columnconfigure(0, weight=1)
         actions.columnconfigure(1, weight=1)
         actions.columnconfigure(2, weight=1)
@@ -187,7 +197,7 @@ class DesktopUi:
         self._capture_button.grid(row=0, column=2, sticky="ew", padx=(6, 0))
 
         self._log = tk_text(frame)
-        self._log.grid(row=8, column=0, columnspan=2, sticky="nsew")
+        self._log.grid(row=9, column=0, columnspan=2, sticky="nsew")
 
         self._append_log("Ready.")
         self._root.after(100, self._drain_events)
@@ -215,6 +225,24 @@ class DesktopUi:
             container, text="TCP", variable=self._transport, value="tcp"
         ).grid(row=0, column=1, sticky="w", padx=(12, 0))
 
+    def _add_detection_toggle(self, parent: ttk.Frame, row: int) -> None:
+        ttk.Label(parent, text="Detection").grid(row=row, column=0, sticky="w", pady=2)
+        ttk.Checkbutton(
+            parent,
+            text="Enable object detection and alerts",
+            variable=self._detection_enabled,
+        ).grid(row=row, column=1, sticky="w", pady=2)
+
+    def _add_available_labels(self, parent: ttk.Frame, row: int) -> None:
+        ttk.Label(parent, text="Available labels").grid(
+            row=row, column=0, sticky="w", pady=2
+        )
+        ttk.Label(
+            parent,
+            textvariable=self._available_labels_text,
+            wraplength=720,
+        ).grid(row=row, column=1, sticky="ew", pady=2)
+
     def _start_monitor(self) -> None:
         if self._monitor_thread is not None and self._monitor_thread.is_alive():
             return
@@ -226,6 +254,11 @@ class DesktopUi:
             return
 
         self._stop_event.clear()
+        self._available_labels_text.set(
+            "Detection disabled."
+            if not config.detection_enabled
+            else "Waiting for detector results."
+        )
         notifier = CooldownNotifier(
             CompositeNotifier(
                 [
@@ -257,7 +290,8 @@ class DesktopUi:
                 config,
                 notifier,
                 stop_requested=self._stop_event.is_set,
-                frame_observer=self._queue_frame,
+                frame_observer=self._publish_latest_monitor_frame,
+                detection_observer=self._publish_latest_available_labels,
                 error_observer=self._queue_monitor_error,
             )
         except (MonitorError, ValueError) as exc:
@@ -311,6 +345,7 @@ class DesktopUi:
         return UiSettings(
             source=self._source.get().strip(),
             target=self._target.get().strip(),
+            detection_enabled=self._detection_enabled.get(),
             model_name=self._model_name.get().strip(),
             confidence=_parse_float("confidence", self._confidence.get()),
             transport=self._transport.get().strip().lower(),
@@ -344,13 +379,19 @@ class DesktopUi:
         latest_frame = self._latest_frame.pop()
         if latest_frame is not None:
             self._show_frame(latest_frame)
+        latest_labels = self._latest_labels.pop()
+        if latest_labels is not None:
+            self._available_labels_text.set(_format_available_labels(latest_labels))
         self._root.after(33, self._drain_events)
 
-    def _queue_frame(self, frame: VideoFrame) -> None:
+    def _publish_latest_monitor_frame(self, frame: VideoFrame) -> None:
         self._latest_frame.set(_copy_frame(frame))
 
     def _queue_monitor_error(self, exc: Exception) -> None:
         self._events.put(UiLogEvent(f"Monitor error: {exc}. Retrying."))
+
+    def _publish_latest_available_labels(self, labels: tuple[str, ...]) -> None:
+        self._latest_labels.set(labels)
 
     def _show_frame(self, frame: VideoFrame) -> None:
         image = _frame_to_photo_image(frame)
@@ -398,6 +439,22 @@ class LatestFrameSlot:
         return frame
 
 
+class LatestLabelsSlot:
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._labels: tuple[str, ...] | None = None
+
+    def set(self, labels: tuple[str, ...]) -> None:
+        with self._lock:
+            self._labels = labels
+
+    def pop(self) -> tuple[str, ...] | None:
+        with self._lock:
+            labels = self._labels
+            self._labels = None
+        return labels
+
+
 def tk_text(parent: ttk.Frame) -> Text:
     return Text(parent, height=12, wrap="word", state=DISABLED)
 
@@ -437,6 +494,12 @@ def _fit_frame_for_preview(
     return frame[::row_step, ::column_step]
 
 
+def _format_available_labels(labels: tuple[str, ...]) -> str:
+    if not labels:
+        return "No objects detected."
+    return ", ".join(labels)
+
+
 def _parse_float(name: str, value: str) -> float:
     try:
         return float(value)
@@ -462,6 +525,18 @@ def _env_float(name: str, fallback: float) -> float:
         return float(value)
     except ValueError as exc:
         raise ValueError(f"{name} precisa ser um numero") from exc
+
+
+def _env_bool(name: str, fallback: bool) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return fallback
+    normalized = value.strip().lower()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+    raise ValueError(f"{name} precisa ser true ou false")
 
 
 def _validate_transport(transport: str) -> None:

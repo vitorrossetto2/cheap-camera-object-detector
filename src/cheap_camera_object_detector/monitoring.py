@@ -18,7 +18,7 @@ from cheap_camera_object_detector.rtsp_capture import (
     CaptureError,
     FrameReadResult,
     open_rtsp_capture,
-    read_valid_frame,
+    read_latest_valid_frame,
 )
 from cheap_camera_object_detector.protocols import VideoCaptureProtocol, VideoFrame
 
@@ -26,6 +26,7 @@ from cheap_camera_object_detector.protocols import VideoCaptureProtocol, VideoFr
 logger = logging.getLogger(__name__)
 MONITOR_MINIMUM_FRAME_STDDEV = 10.0
 MONITOR_MINIMUM_FRAME_READ_ATTEMPTS = 30
+MONITOR_LATEST_FRAME_DRAIN_READS = 4
 
 
 class MonitorError(RuntimeError):
@@ -36,10 +37,11 @@ class MonitorError(RuntimeError):
 class MonitorConfig:
     source: str
     target: str
+    detection_enabled: bool = True
     model_name: str = "yolo11n.pt"
     confidence: float = 0.35
     image_size: int = 640
-    frame_interval_seconds: float = 0.2
+    frame_interval_seconds: float = 0.5
     open_timeout_ms: int = 10_000
     read_timeout_ms: int = 10_000
     warmup_frames: int = 3
@@ -60,6 +62,7 @@ def monitor_camera(
     max_frames: int = 0,
     stop_requested: Callable[[], bool] | None = None,
     frame_observer: Callable[[VideoFrame], None] | None = None,
+    detection_observer: Callable[[tuple[str, ...]], None] | None = None,
     error_observer: Callable[[Exception], None] | None = None,
 ) -> None:
     _validate_config(config)
@@ -71,11 +74,12 @@ def monitor_camera(
         raise ValueError("max_frames nao pode ser negativo")
 
     logger.info(
-        "monitor_start source=%s target=%s model=%s confidence=%s image_size=%s "
+        "monitor_start source=%s target=%s detection_enabled=%s model=%s confidence=%s image_size=%s "
         "frame_interval_seconds=%s open_timeout_ms=%s read_timeout_ms=%s "
         "warmup_frames=%s frame_read_attempts=%s prefer_tcp=%s max_frames=%s",
         _mask_source_password(config.source),
         config.target,
+        config.detection_enabled,
         config.model_name,
         config.confidence,
         config.image_size,
@@ -87,19 +91,28 @@ def monitor_camera(
         config.prefer_tcp,
         max_frames,
     )
-    detector = YoloObjectDetector(
-        config.model_name,
-        confidence=config.confidence,
-        image_size=config.image_size,
+    detector = (
+        YoloObjectDetector(
+            config.model_name,
+            confidence=config.confidence,
+            image_size=config.image_size,
+        )
+        if config.detection_enabled
+        else None
     )
 
     frame_count = 0
     capture_session = _MonitorCaptureSession(config)
-    detection_runner = _AsyncDetectionRunner(
-        config,
-        detector,
-        notifier,
-        error_observer,
+    detection_runner = (
+        _AsyncDetectionRunner(
+            config,
+            detector,
+            notifier,
+            detection_observer,
+            error_observer,
+        )
+        if detector is not None
+        else None
     )
 
     try:
@@ -112,7 +125,8 @@ def monitor_camera(
                 frame = capture_session.read_frame(frame_count)
                 if frame_observer is not None:
                     frame_observer(frame)
-                detection_runner.start_if_idle(frame, frame_count)
+                if detection_runner is not None:
+                    detection_runner.start_if_idle(frame, frame_count)
             except Exception as exc:
                 logger.exception(
                     "monitor_iteration_failed frame=%s error=%s",
@@ -137,7 +151,8 @@ def monitor_camera(
                 time.sleep(config.frame_interval_seconds)
     finally:
         capture_session.close()
-        detection_runner.close()
+        if detection_runner is not None:
+            detection_runner.close()
         logger.info(
             "monitor_stop source=%s frames_processed=%s",
             _mask_source_password(config.source),
@@ -197,7 +212,7 @@ class _MonitorCaptureSession:
             )
             self._needs_warmup = True
 
-        result = read_valid_frame(
+        result = read_latest_valid_frame(
             self._capture,
             attempts=max(
                 self._config.frame_read_attempts,
@@ -206,6 +221,7 @@ class _MonitorCaptureSession:
             warmup_frames=self._config.warmup_frames if self._needs_warmup else 0,
             log_context="monitor_capture",
             minimum_frame_stddev=MONITOR_MINIMUM_FRAME_STDDEV,
+            drain_reads=MONITOR_LATEST_FRAME_DRAIN_READS,
         )
         self._needs_warmup = False
         return result
@@ -217,11 +233,13 @@ class _AsyncDetectionRunner:
         config: MonitorConfig,
         detector: YoloObjectDetector,
         notifier: AlertNotifier,
+        detection_observer: Callable[[tuple[str, ...]], None] | None,
         error_observer: Callable[[Exception], None] | None,
     ) -> None:
         self._config = config
         self._detector = detector
         self._notifier = notifier
+        self._detection_observer = detection_observer
         self._error_observer = error_observer
         self._thread: threading.Thread | None = None
 
@@ -248,6 +266,15 @@ class _AsyncDetectionRunner:
         try:
             detections = self._detector.detect(frame)
             _log_detections(detections, frame_count, self._config.source)
+            available_labels = _available_labels(detections)
+            if self._detection_observer is not None:
+                try:
+                    self._detection_observer(available_labels)
+                except Exception:
+                    logger.exception(
+                        "monitor_detection_observer_failed frame=%s",
+                        frame_count,
+                    )
 
             matches = matching_detections(detections, self._config.target)
             _log_match_evaluation(
@@ -331,6 +358,14 @@ def _log_match_evaluation(
     )
 
 
+def _available_labels(detections: list[Detection]) -> tuple[str, ...]:
+    labels: list[str] = []
+    for detection in detections:
+        if detection.label not in labels:
+            labels.append(detection.label)
+    return tuple(labels)
+
+
 def _mask_source_password(source: str) -> str:
     parsed = urlsplit(source)
     if parsed.password is None or parsed.hostname is None:
@@ -350,7 +385,7 @@ def _validate_config(config: MonitorConfig) -> None:
     if not config.source.strip():
         logger.error("monitor_validation_failed parameter=source reason=blank")
         raise ValueError("source precisa ser informado")
-    if not config.target.strip():
+    if config.detection_enabled and not config.target.strip():
         logger.error("monitor_validation_failed parameter=target reason=blank")
         raise ValueError("target precisa ser informado")
     if config.confidence <= 0 or config.confidence > 1:
@@ -397,7 +432,8 @@ def _validate_config(config: MonitorConfig) -> None:
         )
         raise ValueError("frame_read_attempts precisa ser maior que zero")
     logger.info(
-        "monitor_validation_passed source=%s target=%s",
+        "monitor_validation_passed source=%s target=%s detection_enabled=%s",
         _mask_source_password(config.source),
         config.target,
+        config.detection_enabled,
     )

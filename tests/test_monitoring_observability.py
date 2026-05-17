@@ -25,14 +25,14 @@ class MonitoringObservabilityTests(unittest.TestCase):
         fake_cv2 = FakeCv2(read_frames=[fake_frame()])
 
         with (
-            patch("image_behaviour_alerts.rtsp_capture._cv2", return_value=fake_cv2),
-            patch("image_behaviour_alerts.monitoring.YoloObjectDetector", FakeDetector),
-            self.assertLogs("image_behaviour_alerts.monitoring", level="INFO") as logs,
+            patch("cheap_camera_object_detector.rtsp_capture._cv2", return_value=fake_cv2),
+            patch("cheap_camera_object_detector.monitoring.YoloObjectDetector", FakeDetector),
+            self.assertLogs("cheap_camera_object_detector.monitoring", level="INFO") as logs,
         ):
             monitor_camera(
                 MonitorConfig(
                     source="rtsp://user:secret@camera.local:554/stream1",
-                    target="dog",
+                    target="person",
                     frame_interval_seconds=0,
                     warmup_frames=0,
                 ),
@@ -64,6 +64,35 @@ class MonitoringObservabilityTests(unittest.TestCase):
         self.assertEqual(1, len(fake_cv2.captures))
         self.assertTrue(fake_cv2.captures[0].released)
 
+    def test_monitor_reports_available_labels_after_detection_runs(self) -> None:
+        FakeDetector.results = [
+            [
+                Detection("person", 0.8, (1, 2, 3, 4)),
+                Detection("person", 0.7, (5, 6, 7, 8)),
+                Detection("cell phone", 0.6, (9, 10, 11, 12)),
+            ]
+        ]
+        observed_labels: list[tuple[str, ...]] = []
+        fake_cv2 = FakeCv2(read_frames=[fake_frame()])
+
+        with (
+            patch("cheap_camera_object_detector.rtsp_capture._cv2", return_value=fake_cv2),
+            patch("cheap_camera_object_detector.monitoring.YoloObjectDetector", FakeDetector),
+        ):
+            monitor_camera(
+                MonitorConfig(
+                    source="rtsp://user:secret@camera.local:554/stream1",
+                    target="person",
+                    frame_interval_seconds=0,
+                    warmup_frames=0,
+                ),
+                NoopNotifier(),
+                max_frames=1,
+                detection_observer=observed_labels.append,
+            )
+
+        self.assertEqual([("person", "cell phone")], observed_labels)
+
     def test_monitor_keeps_observing_frames_while_detection_is_busy(self) -> None:
         observed_frames: list[VideoFrame] = []
         three_frames_observed = threading.Event()
@@ -72,11 +101,7 @@ class MonitoringObservabilityTests(unittest.TestCase):
         SlowDetector.started_detection.clear()
         SlowDetector.detected_frames = []
         fake_cv2 = FakeCv2(
-            read_frames=[
-                fake_frame(),
-                fake_frame(),
-                fake_frame(),
-            ]
+            read_frames=[fake_frame() for _index in range(15)]
         )
 
         def observe_frame(frame: VideoFrame) -> None:
@@ -85,9 +110,9 @@ class MonitoringObservabilityTests(unittest.TestCase):
                 three_frames_observed.set()
 
         with (
-            patch("image_behaviour_alerts.rtsp_capture._cv2", return_value=fake_cv2),
-            patch("image_behaviour_alerts.monitoring.YoloObjectDetector", SlowDetector),
-            self.assertLogs("image_behaviour_alerts.monitoring", level="INFO") as logs,
+            patch("cheap_camera_object_detector.rtsp_capture._cv2", return_value=fake_cv2),
+            patch("cheap_camera_object_detector.monitoring.YoloObjectDetector", SlowDetector),
+            self.assertLogs("cheap_camera_object_detector.monitoring", level="INFO") as logs,
         ):
             monitor_thread = threading.Thread(
                 target=monitor_camera,
@@ -123,8 +148,8 @@ class MonitoringObservabilityTests(unittest.TestCase):
         fake_cv2 = FakeCv2(read_frames=[sampled_frame])
 
         with (
-            patch("image_behaviour_alerts.rtsp_capture._cv2", return_value=fake_cv2),
-            patch("image_behaviour_alerts.monitoring.YoloObjectDetector", FakeDetector),
+            patch("cheap_camera_object_detector.rtsp_capture._cv2", return_value=fake_cv2),
+            patch("cheap_camera_object_detector.monitoring.YoloObjectDetector", FakeDetector),
         ):
             monitor_camera(
                 MonitorConfig(
@@ -143,6 +168,65 @@ class MonitoringObservabilityTests(unittest.TestCase):
         self.assertIs(sampled_frame, observed_frames[0])
         self.assertEqual([], fake_cv2.saved_frames)
 
+    def test_monitor_observes_newest_drained_frame(self) -> None:
+        old_frame = high_contrast_frame(fill=30)
+        middle_frame = high_contrast_frame(fill=90)
+        newest_frame = high_contrast_frame(fill=150)
+        observed_frames: list[VideoFrame] = []
+        fake_cv2 = FakeCv2(read_frames=[old_frame, middle_frame, newest_frame])
+        notifier = RecordingNotifier()
+
+        with patch("cheap_camera_object_detector.rtsp_capture._cv2", return_value=fake_cv2):
+            monitor_camera(
+                MonitorConfig(
+                    source="rtsp://user:secret@camera.local:554/stream1",
+                    target="",
+                    detection_enabled=False,
+                    frame_interval_seconds=0,
+                    warmup_frames=0,
+                    frame_read_attempts=1,
+                ),
+                notifier,
+                max_frames=1,
+                frame_observer=observed_frames.append,
+            )
+
+        self.assertEqual(1, len(observed_frames))
+        self.assertIs(newest_frame, observed_frames[0])
+
+    def test_monitor_can_display_frames_without_detection(self) -> None:
+        sampled_frame = fake_frame()
+        observed_frames: list[VideoFrame] = []
+        fake_cv2 = FakeCv2(read_frames=[sampled_frame])
+        notifier = RecordingNotifier()
+
+        with (
+            patch("cheap_camera_object_detector.rtsp_capture._cv2", return_value=fake_cv2),
+            patch(
+                "cheap_camera_object_detector.monitoring.YoloObjectDetector",
+                side_effect=AssertionError("detector should not be created"),
+            ),
+            self.assertLogs("cheap_camera_object_detector.monitoring", level="INFO") as logs,
+        ):
+            monitor_camera(
+                MonitorConfig(
+                    source="rtsp://user:secret@camera.local:554/stream1",
+                    target="",
+                    detection_enabled=False,
+                    frame_interval_seconds=0,
+                    warmup_frames=0,
+                    frame_read_attempts=1,
+                ),
+                notifier,
+                max_frames=1,
+                frame_observer=observed_frames.append,
+            )
+
+        self.assertEqual(1, len(observed_frames))
+        self.assertIs(sampled_frame, observed_frames[0])
+        self.assertEqual([], notifier.events)
+        self.assertNotIn("object_detections frame=", "\n".join(logs.output))
+
     def test_monitor_reports_iteration_error_and_keeps_trying(self) -> None:
         sampled_frame = fake_frame()
         observed_frames: list[VideoFrame] = []
@@ -155,20 +239,20 @@ class MonitoringObservabilityTests(unittest.TestCase):
 
         with (
             patch(
-                "image_behaviour_alerts.monitoring.open_rtsp_capture",
+                "cheap_camera_object_detector.monitoring.open_rtsp_capture",
                 side_effect=[
                     open_capture_results[0],
                     open_capture_results[1],
                 ],
             ),
             patch(
-                "image_behaviour_alerts.monitoring.read_valid_frame",
+                "cheap_camera_object_detector.monitoring.read_latest_valid_frame",
                 side_effect=[
                     CaptureError("camera offline"),
                     FrameReadResult(sampled_frame, reads_used=1, attempts_used=1),
                 ],
             ),
-            patch("image_behaviour_alerts.monitoring.YoloObjectDetector", FakeDetector),
+            patch("cheap_camera_object_detector.monitoring.YoloObjectDetector", FakeDetector),
         ):
             monitor_camera(
                 MonitorConfig(
@@ -197,8 +281,8 @@ class MonitoringObservabilityTests(unittest.TestCase):
         fake_cv2 = FakeCv2(read_frames=[fake_frame(fill=120), sampled_frame])
 
         with (
-            patch("image_behaviour_alerts.rtsp_capture._cv2", return_value=fake_cv2),
-            patch("image_behaviour_alerts.monitoring.YoloObjectDetector", FakeDetector),
+            patch("cheap_camera_object_detector.rtsp_capture._cv2", return_value=fake_cv2),
+            patch("cheap_camera_object_detector.monitoring.YoloObjectDetector", FakeDetector),
         ):
             monitor_camera(
                 MonitorConfig(
@@ -228,8 +312,8 @@ class MonitoringObservabilityTests(unittest.TestCase):
             return stop_checks > 1
 
         with (
-            patch("image_behaviour_alerts.rtsp_capture._cv2", return_value=fake_cv2),
-            patch("image_behaviour_alerts.monitoring.YoloObjectDetector", FakeDetector),
+            patch("cheap_camera_object_detector.rtsp_capture._cv2", return_value=fake_cv2),
+            patch("cheap_camera_object_detector.monitoring.YoloObjectDetector", FakeDetector),
         ):
             monitor_camera(
                 MonitorConfig(
@@ -254,8 +338,8 @@ def fake_frame(*, fill: int | None = None) -> VideoFrame:
     return high_contrast_frame()
 
 
-def high_contrast_frame() -> VideoFrame:
-    return np.array([[[0, 0, 0], [255, 255, 255]]], dtype=np.uint8)
+def high_contrast_frame(*, fill: int = 255) -> VideoFrame:
+    return np.array([[[0, 0, 0], [fill, 255, 255]]], dtype=np.uint8)
 
 
 class FakeCapture:
@@ -269,9 +353,6 @@ class FakeCapture:
         return True, self._frames.pop(0)
 
     def isOpened(self) -> bool:
-        return True
-
-    def set(self, propId: int, value: float) -> bool:
         return True
 
     def release(self) -> None:
@@ -318,7 +399,6 @@ class SlowDetector:
 class FakeCv2:
     CAP_PROP_OPEN_TIMEOUT_MSEC = 1
     CAP_PROP_READ_TIMEOUT_MSEC = 2
-    CAP_PROP_BUFFERSIZE = 3
     CAP_FFMPEG = 4
 
     def __init__(self, read_frames: list[VideoFrame]) -> None:
@@ -351,6 +431,14 @@ class FakeCv2:
 class NoopNotifier:
     def notify(self, event: AlertEvent) -> None:
         pass
+
+
+class RecordingNotifier:
+    def __init__(self) -> None:
+        self.events: list[AlertEvent] = []
+
+    def notify(self, event: AlertEvent) -> None:
+        self.events.append(event)
 
 
 if __name__ == "__main__":
